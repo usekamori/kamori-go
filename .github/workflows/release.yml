@@ -1,0 +1,74 @@
+name: Release
+
+# Triggered by pushing a semver tag (e.g. git tag v1.1.0 && git push --tags).
+# Go modules are versioned by git tag — no build artifact to publish.
+# pkg.go.dev indexes the module automatically once the tag is pushed.
+#
+# Pipeline:
+#   test          → go test -race + go vet (blocks release if failing)
+#   github-release → creates GitHub Release with auto-generated changelog
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go.mod
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Install
+
+            ```bash
+            go get github.com/usekamori/kamori-go@${{ github.ref_name }}
+            ```
+
+            ## Usage
+
+            ```go
+            import "github.com/usekamori/kamori-go/kamori"
+
+            client := kamori.New(kamori.Options{
+                URL:   "https://your-kamori-server.com",
+                Token: "your-ingest-token",
+            })
+            defer client.Shutdown(context.Background())
+
+            client.Log(kamori.Event{"level": "info", "message": "hello"})
+            ```
