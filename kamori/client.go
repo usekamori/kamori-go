@@ -15,7 +15,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"sync"
 	"time"
 )
@@ -33,6 +36,11 @@ type Options struct {
 
 	// Token is the auth token (INGEST_TOKEN) set on the server. Optional.
 	Token string
+
+	// AllowInsecure permits a plaintext http:// URL to a non-localhost host.
+	// By default only https (and http to localhost/127.0.0.1/::1) is allowed, so
+	// the Authorization token is never sent in cleartext over the network.
+	AllowInsecure bool
 
 	// BatchSize is the max number of events to buffer before flushing.
 	// Default: 50.
@@ -82,6 +90,32 @@ type Client struct {
 	wg sync.WaitGroup
 	// stopped is set by Shutdown; Log() becomes a no-op once set.
 	stopped bool
+	// blocked is set (once, at New) when the URL scheme is insecure and not
+	// allowed. When non-empty, flushes drop events instead of transmitting the
+	// token over cleartext. Immutable after New, so it is read without the lock.
+	blocked string
+}
+
+// insecureURLReason returns a non-empty reason when sending to rawURL would
+// expose the token over an unencrypted connection. https is always allowed;
+// http is allowed only to loopback hosts, or anywhere when allowInsecure is set.
+func insecureURLReason(rawURL string, allowInsecure bool) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Sprintf("invalid URL %q: %v", rawURL, err)
+	}
+	switch u.Scheme {
+	case "https":
+		return ""
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" || allowInsecure {
+			return ""
+		}
+		return fmt.Sprintf("refusing to send over plaintext http:// to %q (the Authorization token would be exposed); use https, or set Options.AllowInsecure for a trusted network", host)
+	default:
+		return fmt.Sprintf("unsupported URL scheme %q (expected https)", u.Scheme)
+	}
 }
 
 // New creates a new Client with the given options.
@@ -99,11 +133,16 @@ func New(opts Options) *Client {
 		opts.MaxBuffer = 5 * opts.BatchSize
 	}
 
-	return &Client{
+	c := &Client{
 		opts:    opts,
 		httpCli: &http.Client{Timeout: 10 * time.Second},
 		sem:     make(chan struct{}, opts.MaxConcurrent),
 	}
+	if reason := insecureURLReason(opts.URL, opts.AllowInsecure); reason != "" {
+		c.blocked = reason
+		fmt.Fprintf(os.Stderr, "kamori: %s; logs will be dropped\n", reason)
+	}
+	return c
 }
 
 // Log queues an event. Flushes automatically when the buffer is full or the
@@ -161,6 +200,12 @@ func (c *Client) Flush() {
 		c.timer = nil
 	}
 	c.mu.Unlock()
+
+	// Never transmit the token over an insecure connection.
+	if c.blocked != "" {
+		c.drop(events)
+		return
+	}
 
 	// Acquire the semaphore before launching the goroutine so the slot is
 	// held for the lifetime of the send (including retries).

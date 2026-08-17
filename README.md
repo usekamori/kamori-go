@@ -56,6 +56,11 @@ client := kamori.New(kamori.Options{
     URL:           "https://your-kamori-server.com",
     Token:         "your-log-token",
 
+    // Permit a plaintext http:// URL to a non-localhost host (default false).
+    // By default only https (and http to localhost) is allowed, so the auth
+    // token is never sent in cleartext; otherwise events are dropped.
+    AllowInsecure: false,
+
     // Default service name merged into every event (optional).
     // Overridden per-event if the event already has a "service" key.
     Service:       "api",
@@ -215,6 +220,42 @@ func myHandler(w http.ResponseWriter, r *http.Request) {
     }
 }
 ```
+
+---
+
+## Trace correlation
+
+Kamori attaches a `trace_id` (and `span_id`) to events so logs across services join into
+one chain — query it with the `trace_logs` MCP tool. Use `LogCtx` to attach the id from a
+`context.Context`; an explicit `trace_id` on the event always wins.
+
+```go
+// Reuse an inbound W3C traceparent so the id is shared across services, else generate.
+traceID := kamori.ParseTraceparent(r.Header.Get("traceparent"))
+if traceID == "" {
+    traceID = kamori.GenerateTraceID()
+}
+ctx := kamori.ContextWithTrace(r.Context(), traceID)
+
+client.LogCtx(ctx, kamori.Event{"level": "info", "message": "handling request"})
+```
+
+### OpenTelemetry (optional)
+
+Import the `kamori/otel` subpackage to auto-attach the active span's IDs. It lives in a
+separate package, so the core SDK has no OpenTelemetry dependency:
+
+```go
+import (
+    "github.com/usekamori/kamori-go/kamori"
+    _ "github.com/usekamori/kamori-go/kamori/otel" // registers the OTel bridge
+)
+
+// Inside a span, LogCtx copies the span's trace_id/span_id automatically:
+client.LogCtx(ctx, kamori.Event{"level": "info", "message": "charging card"})
+```
+
+With `slog`, the handler already receives `ctx` in `Handle(ctx, record)` — read it there.
 
 ---
 

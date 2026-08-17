@@ -499,3 +499,38 @@ func TestConcurrentLogIsSafe(t *testing.T) {
 	defer cancel()
 	_ = c.Shutdown(ctx)
 }
+
+// --- F11: HTTPS scheme enforcement ---
+
+func TestInsecureNonLocalhostURLDropsEvents(t *testing.T) {
+	var dropped int64
+	c := kamori.New(kamori.Options{
+		URL:    "http://example.com", // plaintext, non-localhost, not allowed
+		Token:  "secret",
+		OnDrop: func(events []kamori.Event) { atomic.AddInt64(&dropped, int64(len(events))) },
+	})
+	c.Log(kamori.Event{"message": "sensitive"})
+	c.Flush()
+	if got := atomic.LoadInt64(&dropped); got != 1 {
+		t.Fatalf("expected 1 dropped event for insecure URL, got %d", got)
+	}
+}
+
+func TestInsecureURLAllowedWithFlag(t *testing.T) {
+	var received int64
+	srv := httptest.NewServer(recvJSON(t, func(events []map[string]any) {
+		atomic.AddInt64(&received, int64(len(events)))
+	}))
+	defer srv.Close()
+
+	// srv.URL is http://127.0.0.1:... (loopback) — allowed anyway; assert the
+	// AllowInsecure path does not block delivery.
+	c := kamori.New(kamori.Options{URL: srv.URL, AllowInsecure: true})
+	c.Log(kamori.Event{"message": "ok"})
+	if err := c.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if got := atomic.LoadInt64(&received); got != 1 {
+		t.Fatalf("expected 1 received event, got %d", got)
+	}
+}
